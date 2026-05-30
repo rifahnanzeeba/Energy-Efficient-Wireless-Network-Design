@@ -562,3 +562,332 @@ print(results["feature_dataset"].head())
 
 # Optional: save features for future ML work
 # results["feature_dataset"].to_csv("p_leach_features.csv", index=False)
+# =========================================================
+# 18. LEACH BASELINE
+# Cluster-based, CHs send directly to sink
+# =========================================================
+def inter_cluster_transmission_leach(nodes, ch_indices, packet_bits=PACKET_SIZE_BITS):
+    nodes = nodes.copy()
+
+    for ch_idx in ch_indices:
+        if not nodes.at[ch_idx, "alive"]:
+            continue
+
+        d_sink = euclidean_distance(
+            nodes.at[ch_idx, "x"], nodes.at[ch_idx, "y"],
+            SINK_X, SINK_Y
+        )
+
+        nodes.at[ch_idx, "energy"] -= tx_energy(packet_bits, d_sink)
+
+    return nodes
+
+
+def run_leach_simulation(num_rounds=NUM_ROUNDS, save_features=False):
+    nodes = initialize_nodes()
+
+    alive_history = []
+    dead_history = []
+    avg_energy_history = []
+
+    first_dead_round = None
+    half_dead_round = None
+    last_dead_round = None
+
+    feature_frames = []
+
+    for r in range(num_rounds):
+        nodes["dist_to_sink"] = nodes.apply(distance_to_sink, axis=1)
+        nodes = assign_clusters(nodes)
+        nodes, ch_indices = select_cluster_heads(nodes)
+
+        if save_features:
+            feature_frames.append(collect_node_features(nodes, r + 1))
+
+        # Node -> CH
+        nodes = intra_cluster_transmission(nodes)
+
+        # CH -> Sink directly
+        nodes = inter_cluster_transmission_leach(nodes, ch_indices)
+
+        nodes = update_dead_nodes(nodes)
+
+        alive_count = nodes["alive"].sum()
+        dead_count = len(nodes) - alive_count
+        avg_energy = nodes["energy"].mean()
+
+        alive_history.append(alive_count)
+        dead_history.append(dead_count)
+        avg_energy_history.append(avg_energy)
+
+        if first_dead_round is None and dead_count >= 1:
+            first_dead_round = r + 1
+
+        if half_dead_round is None and dead_count >= len(nodes) / 2:
+            half_dead_round = r + 1
+
+        if alive_count == 0:
+            last_dead_round = r + 1
+            break
+
+    feature_dataset = pd.concat(feature_frames, ignore_index=True) if feature_frames else pd.DataFrame()
+
+    return {
+        "protocol": "LEACH",
+        "nodes": nodes,
+        "alive_history": alive_history,
+        "dead_history": dead_history,
+        "avg_energy_history": avg_energy_history,
+        "first_dead_round": first_dead_round,
+        "half_dead_round": half_dead_round,
+        "last_dead_round": last_dead_round,
+        "feature_dataset": feature_dataset
+    }
+
+
+# =========================================================
+# 19. PEGASIS BASELINE
+# Whole network forms one chain, one leader sends to sink
+# =========================================================
+def select_pegasis_leader(nodes, alive_indices):
+    if len(alive_indices) == 0:
+        return None
+
+    alive_nodes = nodes.loc[alive_indices]
+    max_energy = alive_nodes["energy"].max()
+    candidates = alive_nodes[alive_nodes["energy"] == max_energy]
+
+    # Tie-break: nearest to sink
+    leader_idx = candidates["dist_to_sink"].idxmin()
+    return leader_idx
+
+
+def build_pegasis_chain(nodes, alive_indices, leader_idx):
+    if leader_idx is None:
+        return []
+
+    if len(alive_indices) == 1:
+        return [leader_idx]
+
+    remaining = [idx for idx in alive_indices if idx != leader_idx]
+    chain = []
+
+    leader_x = nodes.at[leader_idx, "x"]
+    leader_y = nodes.at[leader_idx, "y"]
+
+    # Start from farthest alive node from leader
+    start_idx = max(
+        remaining,
+        key=lambda idx: euclidean_distance(nodes.at[idx, "x"], nodes.at[idx, "y"], leader_x, leader_y)
+    )
+
+    chain.append(start_idx)
+    remaining.remove(start_idx)
+
+    current = start_idx
+    while remaining:
+        next_idx = min(
+            remaining,
+            key=lambda idx: euclidean_distance(
+                nodes.at[current, "x"], nodes.at[current, "y"],
+                nodes.at[idx, "x"], nodes.at[idx, "y"]
+            )
+        )
+        chain.append(next_idx)
+        remaining.remove(next_idx)
+        current = next_idx
+
+    chain.append(leader_idx)
+    return chain
+
+
+def pegasis_chain_transmission(nodes, chain, packet_bits=PACKET_SIZE_BITS):
+    nodes = nodes.copy()
+
+    if len(chain) == 0:
+        return nodes
+
+    # Node to node along the chain
+    for i in range(len(chain) - 1):
+        src = chain[i]
+        dst = chain[i + 1]
+
+        if not nodes.at[src, "alive"] or not nodes.at[dst, "alive"]:
+            continue
+
+        d = euclidean_distance(
+            nodes.at[src, "x"], nodes.at[src, "y"],
+            nodes.at[dst, "x"], nodes.at[dst, "y"]
+        )
+
+        nodes.at[src, "energy"] -= tx_energy(packet_bits, d)
+        nodes.at[dst, "energy"] -= (rx_energy(packet_bits) + da_energy(packet_bits))
+
+    # Leader to sink
+    leader = chain[-1]
+    if nodes.at[leader, "alive"]:
+        d_sink = euclidean_distance(
+            nodes.at[leader, "x"], nodes.at[leader, "y"],
+            SINK_X, SINK_Y
+        )
+        nodes.at[leader, "energy"] -= tx_energy(packet_bits, d_sink)
+
+    return nodes
+
+
+def run_pegasis_simulation(num_rounds=NUM_ROUNDS, save_features=False):
+    nodes = initialize_nodes()
+
+    alive_history = []
+    dead_history = []
+    avg_energy_history = []
+
+    first_dead_round = None
+    half_dead_round = None
+    last_dead_round = None
+
+    feature_frames = []
+
+    for r in range(num_rounds):
+        nodes["dist_to_sink"] = nodes.apply(distance_to_sink, axis=1)
+        nodes["is_CH"] = False
+        nodes["is_leader"] = False
+
+        alive_indices = nodes[nodes["alive"] == True].index.tolist()
+
+        leader_idx = select_pegasis_leader(nodes, alive_indices)
+        chain = build_pegasis_chain(nodes, alive_indices, leader_idx)
+
+        if leader_idx is not None:
+            nodes.at[leader_idx, "is_leader"] = True
+
+        if save_features:
+            feature_frames.append(collect_node_features(nodes, r + 1))
+
+        nodes = pegasis_chain_transmission(nodes, chain)
+        nodes = update_dead_nodes(nodes)
+
+        alive_count = nodes["alive"].sum()
+        dead_count = len(nodes) - alive_count
+        avg_energy = nodes["energy"].mean()
+
+        alive_history.append(alive_count)
+        dead_history.append(dead_count)
+        avg_energy_history.append(avg_energy)
+
+        if first_dead_round is None and dead_count >= 1:
+            first_dead_round = r + 1
+
+        if half_dead_round is None and dead_count >= len(nodes) / 2:
+            half_dead_round = r + 1
+
+        if alive_count == 0:
+            last_dead_round = r + 1
+            break
+
+    feature_dataset = pd.concat(feature_frames, ignore_index=True) if feature_frames else pd.DataFrame()
+
+    return {
+        "protocol": "PEGASIS",
+        "nodes": nodes,
+        "alive_history": alive_history,
+        "dead_history": dead_history,
+        "avg_energy_history": avg_energy_history,
+        "first_dead_round": first_dead_round,
+        "half_dead_round": half_dead_round,
+        "last_dead_round": last_dead_round,
+        "feature_dataset": feature_dataset
+    }
+
+
+# =========================================================
+# 20. UPDATE P-LEACH RETURN LABEL
+# Optional: use this wrapper so protocol name appears
+# =========================================================
+def run_p_leach_simulation_labeled(num_rounds=NUM_ROUNDS, save_features=True):
+    results = run_p_leach_simulation(num_rounds=num_rounds, save_features=save_features)
+    results["protocol"] = "P-LEACH"
+    return results
+
+
+# =========================================================
+# 21. COMPARISON PLOTTING
+# =========================================================
+def plot_protocol_comparison(leach_results, pegasis_results, p_leach_results):
+    protocol_results = [leach_results, pegasis_results, p_leach_results]
+
+    # Dead nodes comparison
+    plt.figure(figsize=(10, 6))
+    for result in protocol_results:
+        rounds = np.arange(1, len(result["dead_history"]) + 1)
+        plt.plot(rounds, result["dead_history"], label=result["protocol"])
+    plt.xlabel("Rounds")
+    plt.ylabel("Dead Nodes")
+    plt.title("Dead Nodes vs Rounds")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+    # Alive nodes comparison
+    plt.figure(figsize=(10, 6))
+    for result in protocol_results:
+        rounds = np.arange(1, len(result["alive_history"]) + 1)
+        plt.plot(rounds, result["alive_history"], label=result["protocol"])
+    plt.xlabel("Rounds")
+    plt.ylabel("Alive Nodes")
+    plt.title("Alive Nodes vs Rounds")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+    # Average energy comparison
+    plt.figure(figsize=(10, 6))
+    for result in protocol_results:
+        rounds = np.arange(1, len(result["avg_energy_history"]) + 1)
+        plt.plot(rounds, result["avg_energy_history"], label=result["protocol"])
+    plt.xlabel("Rounds")
+    plt.ylabel("Average Residual Energy")
+    plt.title("Average Energy vs Rounds")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+
+# =========================================================
+# 22. SUMMARY TABLE
+# =========================================================
+def create_summary_table(leach_results, pegasis_results, p_leach_results):
+    summary = pd.DataFrame([
+        {
+            "Protocol": leach_results["protocol"],
+            "FND": leach_results["first_dead_round"],
+            "HND": leach_results["half_dead_round"],
+            "LND": leach_results["last_dead_round"]
+        },
+        {
+            "Protocol": pegasis_results["protocol"],
+            "FND": pegasis_results["first_dead_round"],
+            "HND": pegasis_results["half_dead_round"],
+            "LND": pegasis_results["last_dead_round"]
+        },
+        {
+            "Protocol": p_leach_results["protocol"],
+            "FND": p_leach_results["first_dead_round"],
+            "HND": p_leach_results["half_dead_round"],
+            "LND": p_leach_results["last_dead_round"]
+        }
+    ])
+    return summary
+
+
+# =========================================================
+# 23. RUN ALL THREE PROTOCOLS
+# =========================================================
+leach_results = run_leach_simulation()
+pegasis_results = run_pegasis_simulation()
+p_leach_results = run_p_leach_simulation_labeled()
+
+plot_protocol_comparison(leach_results, pegasis_results, p_leach_results)
+
+summary_table = create_summary_table(leach_results, pegasis_results, p_leach_results)
+print(summary_table)
